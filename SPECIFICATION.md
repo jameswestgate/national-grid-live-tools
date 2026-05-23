@@ -333,3 +333,9 @@ Two ways to validate output without containerising:
 
 **Last reviewed:** 2026-05-23
 **Owner:** James Westgate
+
+Note: the commercial font can be bought here:
+https://www.myfonts.com/collections/proza-font-bureau-roffa
+
+The styles are:
+
