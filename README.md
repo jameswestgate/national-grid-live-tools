@@ -7,6 +7,9 @@ history on-device (the APIs paginate in small windows — Carbon Intensity caps 
 14 days), so this service pre-aggregates it into a single `snapshot.json` served
 over GitHub Pages.
 
+**Live:** https://jameswestgate.github.io/national-grid-live-tools/v1/snapshot.json
+(rebuilt daily by the [Backfill snapshot](.github/workflows/backfill.yml) Action).
+
 See [`SPECIFICATION.md`](SPECIFICATION.md) for the full design.
 
 ## How it works
@@ -35,8 +38,8 @@ of MB — not a full re-fetch. The accumulating `data/*.csv` is the source of tr
 - `generation = Σ fuels`, `transfers = Σ interconnectors`, `demand = generation + transfers`.
 
 ### Accuracy vs grid.iamkate.com
-**Past year matches closely** (verified): generation 27.7 vs 27.7, demand 30.5 vs 30.7, gas 8.8 vs 8.2, wind 10.4 vs 10.9, solar 1.9 vs 2.1, price £81 vs £80, interconnectors within ~0.1.
-**All Time can't fully match**: Carbon Intensity starts 2018-05 and FUELINST ~2018, but Kate's all-time spans 2012+, so the high-coal early years are missing (our all-time coal ≈0.5 vs 4.13). It's real data from 2018 onward — a hard API limit, not a bug.
+**Past year matches closely** (verified live in the app): generation 27.4 vs 27.7, demand 30.5 vs 30.7, gas 8.22 vs 8.15, wind 10.75 vs 10.92, solar 1.89 vs 2.06, nuclear 3.82 vs 3.87, price £80.6 vs £79.8, emissions 122 vs 121 — every fuel within ~0.3 GW.
+**All Time can't fully match**: Carbon Intensity starts 2018-05 and FUELINST ~2018, but Kate's all-time spans 2012+, so the high-coal early years are missing (our all-time coal ≈0.5 vs 4.13, dragging total generation ~3.8 low). It's real data from 2018 onward — a hard API limit, not a bug.
 
 ## Granularity & file size
 
@@ -59,18 +62,18 @@ Hosted size is driven by point count (~290 B/point raw; **Pages auto-gzips**):
    (this one run is heavier — it fetches ~1 year of days + monthly samples back to 2018).
 4. After that the daily `cron` keeps it current automatically.
 
-Published URLs (replace `OWNER`/`REPO`):
-- `https://OWNER.github.io/REPO/v1/snapshot.json`
-- `https://OWNER.github.io/REPO/v1/manifest.json` (cheap freshness check)
+Published URLs:
+- `https://jameswestgate.github.io/national-grid-live-tools/v1/snapshot.json`
+- `https://jameswestgate.github.io/national-grid-live-tools/v1/manifest.json` (cheap freshness check)
 
 ## Wiring the app
 
-In `AppConfig.swift`:
+In `AppConfig.swift` (already wired):
 
 ```swift
 static let `default` = AppConfig(
     live: .real,
-    snapshot: .url(URL(string: "https://OWNER.github.io/REPO/v1/snapshot.json")!),
+    snapshot: .url(URL(string: "https://jameswestgate.github.io/national-grid-live-tools/v1/snapshot.json")!),
     refreshInterval: .seconds(300)
 )
 ```
