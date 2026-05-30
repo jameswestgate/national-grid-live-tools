@@ -110,5 +110,8 @@ public/v1/snapshot.json, manifest.json published output (deployed to Pages)
 SPECIFICATION.md                      full service spec
 ```
 
-All data © their providers — Elexon (BMRS), National Grid ESO & University of
+## License
+
+Source code licensed under the [MIT License](LICENSE). All aggregated data
+remains © its providers — Elexon (BMRS), National Grid ESO & University of
 Oxford (Carbon Intensity, CC BY 4.0), NESO (Open Licence).
