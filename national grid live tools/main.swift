@@ -157,8 +157,10 @@ func aggregateDay(_ day: Date) -> DayAgg? {
     let emb = embedded(for: day)
     agg.fuels[.wind] = gw("WIND") + emb.wind
     agg.fuels[.solar] = emb.solar
-    agg.generation = FuelType.allCases.reduce(0.0) { $0 + (agg.fuels[$1] ?? 0) }
-    agg.transfers = Interconnector.allCases.reduce(0.0) { $0 + (agg.ics[$1] ?? 0) }
+    // Match grid.iamkate.com: pumped storage is a TRANSFER, not generation.
+    // generation = all fuels EXCEPT pumped; transfers = interconnectors + pumped.
+    agg.generation = FuelType.allCases.filter { $0 != .pumped }.reduce(0.0) { $0 + (agg.fuels[$1] ?? 0) }
+    agg.transfers = Interconnector.allCases.reduce(0.0) { $0 + (agg.ics[$1] ?? 0) } + (agg.fuels[.pumped] ?? 0)
     agg.demand = agg.generation + agg.transfers
     if let cd = fetch("https://api.carbonintensity.org.uk/intensity/\(isoZ(from))/\(isoZ(to))"),
        let obj = try? JSONSerialization.jsonObject(with: cd) as? [String: Any], let data = obj["data"] as? [[String: Any]] {
@@ -215,9 +217,27 @@ func timeSeries(_ rows: [Row], _ g: Granularity) -> TimeSeries {
     func arr(_ c: String) -> [Double?] { rows.map { round3($0.vals[c] ?? nil) } }
     var fuels: [FuelType: [Double?]] = [:]; for f in FuelType.allCases { fuels[f] = arr(f.rawValue) }
     var ics: [Interconnector: [Double?]] = [:]; for ic in Interconnector.allCases { ics[ic] = arr(ic.rawValue) }
+    // Recompute generation/transfers/demand from the stored components so the fix
+    // applies to ALL historical rows (no API re-fetch): generation = fuels except
+    // pumped; transfers = interconnectors + pumped; demand = generation + transfers.
+    func genRow(_ r: Row) -> Double? {
+        let v = FuelType.allCases.filter { $0 != .pumped }.compactMap { r.vals[$0.rawValue] ?? nil }
+        return v.isEmpty ? nil : v.reduce(0, +)
+    }
+    func transRow(_ r: Row) -> Double? {
+        let icv = Interconnector.allCases.compactMap { r.vals[$0.rawValue] ?? nil }
+        let pumped = r.vals["pumped"] ?? nil
+        return (icv.isEmpty && pumped == nil) ? nil : icv.reduce(0, +) + (pumped ?? 0)
+    }
+    let generationArr = rows.map { round3(genRow($0)) }
+    let transfersArr = rows.map { round3(transRow($0)) }
+    let demandArr = rows.map { r -> Double? in
+        let gen = genRow(r), tr = transRow(r)
+        return (gen == nil && tr == nil) ? nil : round3((gen ?? 0) + (tr ?? 0))
+    }
     return TimeSeries(from: rows.first?.date ?? "", to: rows.last?.date ?? "", granularity: g, dates: rows.map { $0.date },
-                      price: arr("price"), emissions: arr("emissions"), demand: arr("demand"),
-                      generation: arr("generation"), transfers: arr("transfers"), fuels: fuels, interconnectors: ics)
+                      price: arr("price"), emissions: arr("emissions"), demand: demandArr,
+                      generation: generationArr, transfers: transfersArr, fuels: fuels, interconnectors: ics)
 }
 func writeOutputs(daily: [Row], monthly: [Row], outDir: String) {
     let snap = Snapshot(schemaVersion: 1, generated: Date(),
