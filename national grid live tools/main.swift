@@ -99,19 +99,20 @@ let nesoResources: [Int: String] = [
 ]
 var embeddedByDate: [String: (wind: Double, solar: Double)] = [:]
 var loadedYears = Set<Int>()
-func loadEmbedded(year: Int) {
-    guard !loadedYears.contains(year), let res = nesoResources[year] else { return }
-    loadedYears.insert(year)
-    guard let d = fetch("https://api.neso.energy/datastore/dump/\(res)"),
-          let csv = String(data: d, encoding: .utf8) else { return }
-    let lines = csv.split(separator: "\n", omittingEmptySubsequences: true)
+/// Parses a NESO demand-data CSV (historic year dump OR the rolling
+/// demanddataupdate) into per-day MEAN embedded wind/solar in GW.
+func parseEmbeddedCSV(_ csv: String) -> [String: (wind: Double, solar: Double)] {
+    // NB: split on ANY newline — demanddataupdate.csv uses CRLF, and in Swift
+    // "\r\n" is a single Character that does NOT match "\n" (the historic year
+    // dumps are LF-only, which is why a plain "\n" split used to work).
+    let lines = csv.split(whereSeparator: \.isNewline)
     func cells(_ s: Substring) -> [String] {
         s.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"\r ")) }
     }
     guard let header = lines.first.map(cells),
           let iDate = header.firstIndex(of: "SETTLEMENT_DATE"),
           let iWind = header.firstIndex(of: "EMBEDDED_WIND_GENERATION"),
-          let iSolar = header.firstIndex(of: "EMBEDDED_SOLAR_GENERATION") else { return }
+          let iSolar = header.firstIndex(of: "EMBEDDED_SOLAR_GENERATION") else { return [:] }
     var sums: [String: (w: Double, s: Double, n: Double)] = [:]
     for line in lines.dropFirst() {
         let c = cells(line)
@@ -119,10 +120,35 @@ func loadEmbedded(year: Int) {
         let date = String(c[iDate].prefix(10))
         var cur = sums[date] ?? (0,0,0); cur.w += w; cur.s += s; cur.n += 1; sums[date] = cur
     }
-    for (date, v) in sums where v.n > 0 { embeddedByDate[date] = (v.w/v.n/1000.0, v.s/v.n/1000.0) }
+    var out: [String: (wind: Double, solar: Double)] = [:]
+    for (date, v) in sums where v.n > 0 { out[date] = (v.w/v.n/1000.0, v.s/v.n/1000.0) }
+    return out
+}
+func loadEmbedded(year: Int) {
+    guard !loadedYears.contains(year), let res = nesoResources[year] else { return }
+    loadedYears.insert(year)
+    guard let d = fetch("https://api.neso.energy/datastore/dump/\(res)"),
+          let csv = String(data: d, encoding: .utf8) else { return }
+    for (date, v) in parseEmbeddedCSV(csv) { embeddedByDate[date] = v }
+}
+// The historic year dump lags ~3 weeks behind publication (e.g. on 2026-06-02
+// the 2026 dump ended at 2026-05-12), which used to leave recent days with
+// solar 0 / metered-only wind. The rolling demanddataupdate.csv — the same
+// file grid.iamkate.com ingests, byte-identical where the two overlap —
+// covers the gap, so overlay its day-means for dates the year dump lacks.
+var loadedRollingUpdate = false
+func loadRollingEmbeddedUpdate() {
+    guard !loadedRollingUpdate else { return }
+    loadedRollingUpdate = true
+    guard let d = fetch("https://api.neso.energy/dataset/7a12172a-939c-404c-b581-a6128b74f588/resource/177f6fa4-ae49-4182-81ea-0c6b35f26ca6/download/demanddataupdate.csv"),
+          let csv = String(data: d, encoding: .utf8) else { return }
+    for (date, v) in parseEmbeddedCSV(csv) where embeddedByDate[date] == nil { embeddedByDate[date] = v }
 }
 func embedded(for day: Date) -> (wind: Double, solar: Double) {
-    loadEmbedded(year: calendar.component(.year, from: day)); return embeddedByDate[dayString(day)] ?? (0,0)
+    loadEmbedded(year: calendar.component(.year, from: day))
+    if let v = embeddedByDate[dayString(day)] { return v }
+    loadRollingEmbeddedUpdate()
+    return embeddedByDate[dayString(day)] ?? (0,0)
 }
 
 // MARK: - Per-day aggregation
@@ -240,12 +266,23 @@ func timeSeries(_ rows: [Row], _ g: Granularity) -> TimeSeries {
                       generation: generationArr, transfers: transfersArr, fuels: fuels, interconnectors: ics)
 }
 func writeOutputs(daily: [Row], monthly: [Row], outDir: String) {
+    // "Past year" matches the site: the 52 most recent COMPLETE Monday-start
+    // weeks, skipping the in-progress week (Kate: past_weeks ORDER BY time
+    // DESC LIMIT 1,52) — i.e. daily rows in [monday(today) − 364 d, monday(today)).
+    // The iso8601 UTC calendar's weekOfYear interval starts Monday 00:00 UTC.
+    let weekStart = calendar.dateInterval(of: .weekOfYear, for: Date())?.start
+        ?? calendar.startOfDay(for: Date())
+    let yearStart = calendar.date(byAdding: .day, value: -364, to: weekStart)!
+    let yearRows = daily.filter { r in
+        guard let d = parseDay(r.date) else { return false }
+        return d >= yearStart && d < weekStart
+    }
     let snap = Snapshot(schemaVersion: 1, generated: Date(),
         sources: .init(
             elexon: "Contains BMRS data © Elexon Limited copyright and database right 2026.",
             carbonIntensity: "Carbon intensity data © National Grid ESO and Oxford CS, used under CC BY 4.0.",
             neso: "Contains NESO Data Portal data, used under the NESO Open Licence."),
-        year: timeSeries(Array(daily.suffix(365)), .day), allTime: timeSeries(monthly, .month))
+        year: timeSeries(yearRows, .day), allTime: timeSeries(monthly, .month))
     let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601; enc.outputFormatting = [.sortedKeys]
     try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
     if let d = try? enc.encode(snap) { try? d.write(to: URL(fileURLWithPath: outDir + "/snapshot.json")); logErr("wrote \(outDir)/snapshot.json (\(d.count) B)") }
@@ -279,6 +316,20 @@ if mode == "bootstrap" {
     logErr("bootstrap complete: \(daily.count) daily, \(monthly.count) monthly")
 } else {
     var daily = loadCSV(dailyPath)
+    // Repair rows whose embedded solar/wind were missing when first written
+    // (the historic year dump lags ~3 weeks, so those days were stored with
+    // solar 0 and metered-only wind; a GB day's MEAN solar is never genuinely
+    // zero). Solar is wholly embedded; wind gains the embedded day-mean.
+    var repaired = 0
+    for i in daily.indices where (daily[i].vals["solar"] ?? nil) == 0 {
+        guard let day = parseDay(daily[i].date) else { continue }
+        let emb = embedded(for: day)
+        guard emb.solar > 0 else { continue }
+        daily[i].vals["solar"] = emb.solar
+        daily[i].vals["wind"] = ((daily[i].vals["wind"] ?? nil) ?? 0) + emb.wind
+        repaired += 1
+    }
+    if repaired > 0 { logErr("repaired embedded solar/wind for \(repaired) day(s)") }
     let maxCatchup = Int(env["MAX_CATCHUP"] ?? "14") ?? 14
     var start = daily.last.flatMap { parseDay($0.date) }.map { calendar.date(byAdding: .day, value: 1, to: $0)! }
         ?? calendar.date(byAdding: .day, value: -maxCatchup, to: today)!
@@ -289,16 +340,26 @@ if mode == "bootstrap" {
     saveCSV(dailyPath, daily)
     // Roll up the previous completed month from full-resolution daily data.
     var monthly = loadCSV(monthlyPath)
+    var monthlyChanged = false
     let prevKey = monthString(calendar.date(byAdding: .month, value: -1, to: today)!)
-    if !monthly.contains(where: { $0.date == prevKey }) {
-        let daysIn = daily.filter { $0.date.hasPrefix(prevKey) }
-        if daysIn.count >= 20 {
-            var v: [String: Double?] = [:]
-            for col in valueColumns { let xs = daysIn.compactMap { $0.vals[col] ?? nil }; v[col] = xs.isEmpty ? nil : xs.reduce(0,+)/Double(xs.count) }
-            monthly.append((prevKey, v)); monthly.sort { $0.date < $1.date }; saveCSV(monthlyPath, monthly)
-            logErr("rolled up month \(prevKey)")
-        }
+    if !monthly.contains(where: { $0.date == prevKey }),
+       daily.filter({ $0.date.hasPrefix(prevKey) }).count >= 20 {
+        monthly.append((prevKey, [:])); monthly.sort { $0.date < $1.date }; monthlyChanged = true
+        logErr("rolled up month \(prevKey)")
     }
+    // (Re)compute every monthly row that the daily data fully covers — this both
+    // fills the freshly appended month and keeps earlier rollups consistent
+    // after the embedded repair above.
+    for i in monthly.indices {
+        let daysIn = daily.filter { $0.date.hasPrefix(monthly[i].date) }
+        guard daysIn.count >= 20 else { continue }
+        for col in valueColumns {
+            let xs = daysIn.compactMap { $0.vals[col] ?? nil }
+            monthly[i].vals[col] = xs.isEmpty ? nil : xs.reduce(0,+)/Double(xs.count)
+        }
+        monthlyChanged = true
+    }
+    if monthlyChanged { saveCSV(monthlyPath, monthly) }
     writeOutputs(daily: daily, monthly: monthly, outDir: outDir)
     logErr("daily complete: appended \(appended) day(s); \(daily.count) daily rows, \(monthly.count) monthly rows")
 }
